@@ -1,12 +1,13 @@
 # QueueFair — Documentation Map
 
-Eight files. Each answers exactly one question, so nothing has to be duplicated and nothing goes
+Nine files. Each answers exactly one question, so nothing has to be duplicated and nothing goes
 stale in two places at once.
 
 | I want to know… | Read |
 |---|---|
 | What the system does, and what it promises users | [`product-spec.md`](product-spec.md) |
 | Why it is built this way | [`design.md`](design.md) |
+| How it works at runtime, end to end (the journey) | [`flow.md`](flow.md) |
 | How to build it, and the exact request/response for every endpoint | [`build-plan.md`](build-plan.md) |
 | Why we chose X over Y | [`decisions.md`](decisions.md) |
 | What a concept means, or how to answer a question about it | [`interview-prep.md`](interview-prep.md) |
@@ -64,12 +65,12 @@ interviewer reads them as precisely as this file does.
 
 ## Current state, in one line
 
-**v0 is complete** — phases 0–8 of 15, 105 tests green (19 booking + 86 queue). A real person can
-join a queue, refresh without losing their place, watch their position fall, be admitted at a
-controlled rate, and book a ticket — end to end, across both services, with a forged pass
-rejected. The three races the design is about (oversell, queue-jumping on join, over-admission)
-are each demonstrated failing against a deliberately broken implementation and then holding.
+**Phases 0–13 of 15 built** — v0 (join → admit → book) plus v1's SSE + reconciliation, the whole
+stack in `docker compose` behind Caddy on one origin, and Prometheus + Grafana. A real person can
+queue, refresh without losing their place, watch their position fall over SSE, be admitted at a
+controlled rate, and book — end to end, with a forged pass rejected. The three races the design is
+about (oversell, queue-jumping on join, over-admission) are each demonstrated failing against a
+deliberately broken implementation and then holding.
 
-Still ahead: no UI (Phase 9), no SSE (Phase 10), polling only, and **no load test of any kind** —
-so [`loadtest-report.md`](loadtest-report.md) is empty and no performance number may leave it.
-See [`build-plan.md`](build-plan.md) §6.
+Still ahead: **Phase 14, the k6 load tests — so [`loadtest-report.md`](loadtest-report.md) is empty
+and no performance number may leave it.** See [`build-plan.md`](build-plan.md) §6.

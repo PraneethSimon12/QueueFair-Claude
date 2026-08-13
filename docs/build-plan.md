@@ -16,7 +16,7 @@
 > concepts, ask what I already know, teach the gaps, get a yes. A written plan is not consent to
 > skip the teaching — it is what we teach *from*.
 
-**Status:** Phases 0–8 done — **v0 complete** · Phase 9 next
+**Status:** Phases 0–13 built — metrics + Prometheus/Grafana · Phase 14 (k6 load tests) next
 **Last updated:** 2026-08-02
 
 ---
@@ -547,6 +547,18 @@ fairness line and the honesty line (`product-spec.md` §6).
 **Done when:** two browsers queue, see different positions, and are admitted in arrival order —
 and refreshing visibly changes nothing (Journey B).
 
+**Built 2026-08-02.** `frontend/index.html` (~150 lines, vanilla, 5s polling): the
+join → poll → admitted → book state machine with the §7 client rules (position clamped, ETA
+hedged, dimmed-not-blanked on disconnect, pass in memory, sold-out terminal). Served by the queue
+service at `GET /` so join/position are same-origin (its `MIDDLEWARE=[]` cannot carry CORS); the
+one cross-origin call, `POST /book`, is allowed by `django-cors-headers` on the booking service
+(see `decisions.md`, 2026-08-02, Phase 9). Verified live: `GET / → 200 html`, `POST /join → 200`,
+`OPTIONS /book → 200` with `Access-Control-Allow-Origin`. **Confirmed in-browser 2026-08-02:** the
+full journey join → poll → admitted → book ran end to end at `http://127.0.0.1:8001/` and produced
+a real `Booking #6`. The two-browser arrival-order view (fairness, F4) is a nice thing to eyeball,
+but the mechanism it would show is already proven by the Phase 6–8 tests; the page's job — drive
+the journey correctly — is done.
+
 ### Phase 10 — SSE
 
 `StreamingHttpResponse` with an async generator, hand-rolled frames (CLAUDE.md Rule 5 —
@@ -555,6 +567,16 @@ this is learning surface, not plumbing). One subscriber task per process, bounde
 **Done when:** the page updates with no polling, and `INFO clients` shows **one** Redis
 subscriber per process with 500 browsers connected.
 
+**Built 2026-08-02.** `adapters/broadcaster.py` (one PSUBSCRIBE per process → per-connection
+bounded `asyncio.Queue`s), `record_admissions` PUBLISHes on admission, an async-generator SSE view
+(`retry`/`position`/`admitted` frames, 15s `: ping`, `X-Accel-Buffering: no`), and the frontend now
+uses `EventSource`. Verified live (`text/event-stream` + `retry` + a `position` frame) and by
+`tests/test_broadcaster.py` (one publish → five inboxes through one subscriber; admission
+publishes). A real bug was found and fixed en route: the subscriber needs a DEDICATED pub/sub
+client with no read timeout, or the shared client's 2s `socket_timeout` churns the subscription
+(see `decisions.md`). **Pending:** the "one subscriber with 500 browsers" scale check is a Phase 14
+load-test concern, not yet run.
+
 ### Phase 11 — Position arithmetic and reconciliation
 
 Switch from per-client `ZRANK` to `my_seq − admitted`, with periodic `ZRANK` reconciliation and
@@ -562,17 +584,42 @@ the upward-correction clamp (FR-7).
 **Done when:** `INFO commandstats` shows Redis ops flat from 1K to 10K connections — the
 measurement that makes the whole design worth having.
 
+**Built 2026-08-02.** The arithmetic (`seq - admitted`) was already in Phase 10's stream; this
+phase added the missing half: every `SSE_RECONCILE_SECONDS` (30s, `settings.py`) the loop re-checks
+the authoritative ZRANK via `_reconcile` and re-pins `sequence`, and `core.state.clamp_position`
+guarantees a correction is never shown moving the position up (FR-7). `tests/test_reconcile.py`
+pins both invariants; `check` + broadcaster tests green; stream re-smoked live. **Pending:** the
+flat-Redis-ops-1K→10K measurement is the Phase 14 load test, not yet run.
+
 ### Phase 12 — Docker Compose
 
 Both services, Redis 7, Postgres 16 (pinned to match production — the dev box runs 18, a parity
 gap already logged), Caddy with `proxy_buffering off`.
 **Done when:** `make up` gives a working system on a clean machine.
 
+**Built 2026-08-02.** `docker-compose.yml` (Redis 7, Postgres 16, queue, booking, Caddy),
+`Dockerfile`s for both services (`gunicorn` via a `sys_platform != "win32"` marker), a `Caddyfile`
+serving the frontend static and proxying both APIs on one origin (`:8080`, `flush_interval -1` for
+SSE), a `Makefile`, and `.dockerignore`/`.env.example`. Verified live: all five containers boot
+healthy, and the full **join → admit → book** loop runs through Caddy on one origin and persists a
+booking in the containerised Postgres. Because it is one origin, the Phase 9 CORS/serve-the-page
+hacks are not needed here (kept for the non-Docker local flow). **Pending:** clean-machine test —
+verified on the dev box, not yet on a fresh clone.
+
 ### Phase 13 — Prometheus and Grafana
 
 prometheus-client in multiprocess mode; the series in §3.1; one dashboard: queue depth,
 admission throughput, SSE connections, end-to-end wait.
 **Done when:** the dashboard shows a full drop from first join to last booking.
+
+**Built 2026-08-02.** `prometheus-client` in multiprocess mode (`adapters/metrics.py`,
+`gunicorn.conf.py`, `PROMETHEUS_MULTIPROC_DIR` in the queue Dockerfile), an aggregating `/metrics`
+endpoint, and the series `qf_queue_depth` / `qf_sse_connections` / `qf_admissions_total` /
+`qf_admission_batch_seconds` / `qf_position_drift_total` instrumented at the adapter + view layer
+(core/ stays clean). Compose adds Prometheus (scrapes `queue:8001`) and Grafana (:3000, anonymous,
+datasource + dashboard provisioned). Verified: the admitter's counter reaches a web worker's
+/metrics, Prometheus target `up`, metric queryable, Grafana healthy. **Pending:** watching a full
+drop render is a manual eyeball once Phase 14 drives load; `qf_redis_command_seconds` deferred.
 
 ### Phase 14 — k6 and the load test report
 

@@ -4,6 +4,57 @@ Running log of every non-obvious choice. ~5 lines each: what we chose, what we r
 and what would make us revisit. This file is the raw material for the design doc and for
 interview prep — the "Alternatives Considered" section is worth more than the code.
 
+For the runtime *narrative* these choices add up to, see [`flow.md`](flow.md).
+
+---
+
+## Index
+
+A navigation aid, grouped by area (entries stay chronological below). Ctrl-F the title to jump.
+
+**Booking service — data, integrity, auth (Phases 0–4, D1)**
+- SQLite for v0 *(superseded)* · PostgreSQL now
+- Django-native settings (not Pydantic) · Dedicated project venv
+- Booking scope: real + inventory/oversell (deviation from §1)
+- Event identified by a slug natural key
+- Inventory as a denormalized counter (not COUNT(*))
+- Booking integrity enforced by the database (dual idempotency + PROTECT)
+- Admission-token verification: PyJWT, algorithm pinning, required secret
+- Booking endpoint (D1): DRF auth class, atomic-UPDATE claim, idempotent replay
+- Tokens issued only by the queue service (dev minting is a CLI command)
+- Phase 4: concurrency proved with threads at the function level
+
+**Queue service — framework & foundations (Phase 5)**
+- Queue service on async Django (ASGI), not FastAPI
+- Phase 5: the queue service's constraints are asserted, not just commented
+- Redis client: one lazy singleton per process
+- Three things Django does that the Phase 5 comments got wrong
+
+**Fairness, position & admission (Phases 6–8)**
+- Phase 6: join is one Lua script (naive version kept as a test)
+- Phase 6: no QueueRepository Protocol yet, deliberately
+- Phase 6: position and eta are computed in core/
+- Phase 7: /position is one Lua script, for atomicity not speed
+- Phase 7: two position types ("computed" vs "measured")
+- Phase 8: core/ports.py exists now (the Phase 6 prediction settled)
+- Phase 8: the clock is injected, and it is wall-clock, not monotonic
+- Phase 8: qf:{event}:pass:{token} — the first per-waiter key
+- Phase 8: known gap — the pop/sign window is not atomic, and cannot be
+- Phase 8 found a dead config knob: batch_max below burst
+
+**Frontend, SSE & reconciliation (Phases 9–11)**
+- Phase 9: the queue service serves the one static page; CORS lives on booking
+- Phase 10: SSE via one per-process subscriber fanning out to in-memory queues
+- Phase 11: reconciliation re-pins the sequence; the displayed position is clamped
+
+**Infrastructure & observability (Phases 12–13)**
+- Phase 12: Docker Compose, one origin via Caddy (the CORS hacks fall away)
+- Phase 13: metrics in multiprocess mode, Prometheus + Grafana
+
+**Cross-cutting & findings**
+- A five-document spec set, with a claim-to-evidence ledger
+- Finding: localhost→Redis connect takes ~2s here, at the connect-timeout edge
+
 ---
 
 ## 2026-07-18 — SQLite for the v0 booking service (not PostgreSQL)
@@ -458,3 +509,128 @@ to be wrong is worse than none (`docs/index.md`).
   next person does not have to rediscover it.
 - **Revisit when:** Phase 17's dynamic backpressure tunes `rate_per_min` — whatever it does must
   keep `batch_max < burst` or it is tuning nothing.
+
+## 2026-08-02 — Phase 9: the queue service serves the one static page; CORS lives on booking
+
+- **Chose:** the queue service serves `frontend/index.html` at `GET /` (read once at import — no
+  template engine, no per-request IO, no middleware), and the **booking** service gets
+  `django-cors-headers` allowing the queue origin for the one cross-origin call, `POST /book`.
+- **Rejected:** (a) CORS on the queue service — it needs middleware, and `MIDDLEWARE = []` is a
+  pinned invariant (Phase 5); (b) serving the page from the booking service, which only flips the
+  problem — then join/position become the cross-origin calls and the *queue* would need CORS it
+  cannot have; (c) a reverse proxy now — Caddy is Phase 12, a third process for a demo wanted fast.
+- **Why the split is forced, not chosen:** join/position are the frequent calls and live on the
+  queue service, so the page must share that origin to avoid CORS there — which it cannot provide.
+  That leaves exactly one cross-origin call, `book`, and it lands on the booking service, which has
+  a normal middleware stack and can carry `django-cors-headers` safely.
+- **The deviation, said out loud:** `queue_service/settings.py` says "every response this service
+  produces is JSON or an SSE frame." It now also serves one static HTML page. The spirit holds — no
+  template engine, no per-request IO, no middleware, not on the hot path — and the `index` route is
+  deleted at Phase 12 when Caddy fronts both services under one origin.
+- **Revisit when:** Phase 12 — Caddy serves the frontend and proxies both services under one
+  origin; the `index` route and the booking CORS allow-list both go away.
+
+## 2026-08-02 — Phase 10: SSE via one per-process subscriber fanning out to in-memory queues
+
+- **Chose:** one `Broadcaster` per process (`adapters/broadcaster.py`) PSUBSCRIBEs `qf:*:events`
+  ONCE and copies each admission announcement into every connected client's bounded
+  `asyncio.Queue`. Admission PUBLISHes `{admitted_total, total_waiting, rate}` from
+  `record_admissions`. The SSE view pins the waiter's sequence from the authoritative ZRANK at
+  connect, then recomputes position by arithmetic from each broadcast — zero Redis per tick.
+- **Rejected:** one Redis subscription per connection (CLAUDE.md §8's named #1 mistake —
+  thousands of Redis connections); per-client ZRANK every tick (the per-client cost SSE exists to
+  remove); publishing from the core admission controller (kept pure — the publish is an
+  adapter-side effect of recording an admission).
+- **The bug this phase found in itself:** the subscriber first reused the shared command client,
+  which carries a 2s `socket_timeout`. A subscriber IDLES waiting for messages, so that read
+  timeout fires on every quiet interval and churns the subscription. Fix: a DEDICATED pub/sub
+  client with no read timeout — exactly the "separate client for pub/sub" the Phase-5
+  `redis_client` entry predicted Phase 10 would need; a subscribed connection cannot serve normal
+  commands anyway.
+- **Bounded per-connection queue (16), drop-oldest:** every frame carries absolute state, so a slow
+  client that overflows loses only intermediate positions, never the current truth.
+- **Verified:** SSE live (`text/event-stream`, `X-Accel-Buffering: no`, `retry: 3000`, a `position`
+  frame); `tests/test_broadcaster.py` — one publish reaches five inboxes through one subscriber, and
+  `record_admissions` publishes end to end.
+- **Revisit when:** Phase 11 adds ZRANK reconciliation for the arithmetic's abandonment drift;
+  Phase 13 exposes `qf_sse_connections` from `Broadcaster.connection_count()`.
+
+## 2026-08-02 — Finding: localhost→Redis connect takes ~2s here, at the connect-timeout edge
+
+- **Observed:** the first PING costs ~2045 ms; every subsequent op is 0 ms. It is connection
+  ESTABLISHMENT that is slow (a known Windows/WSL2 localhost cost), not Redis.
+- **Symptom:** `REDIS_CONNECT_TIMEOUT_SECONDS = 2.0` sits right on that ~2s, so the concurrent join
+  stress tests intermittently fail to open a fresh pool connection (3 of 16 error with
+  `TimeoutError`). Proven environmental: with `REDIS_CONNECT_TIMEOUT_SECONDS=10` the same tests pass
+  unchanged, and Phase 10's code never touches the join path.
+- **Not fixed in code:** the honest fix is a faster connect (native Redis / Docker networking, or
+  the WSL2 IP instead of `127.0.0.1`), not a bigger timeout that only masks it.
+- **Revisit when:** Phase 12 (Docker) moves Redis into a container — re-measure the connect cost then.
+
+## 2026-08-02 — Phase 11: reconciliation re-pins the sequence; the displayed position is clamped
+
+- **Chose:** the SSE loop reconciles against the authoritative ZRANK every `SSE_RECONCILE_SECONDS`
+  (30s), re-pinning `sequence = zrank_position + admitted_total`, and clamps the displayed position
+  with `min(computed, last_shown)` so a correction is never SHOWN moving up (FR-7).
+- **Rejected:** (a) per-tick ZRANK (the per-client Redis cost the whole design removes); (b) no
+  reconciliation (abandonment drift accumulates forever — `test_position`'s drift test measures the
+  one-per-abandonment cost); (c) letting a correction raise the number (breaks fairness promise F4).
+- **Why the arithmetic was right but incomplete:** Phase 10's `seq - admitted` is monotonic and
+  cheap but drifts up by one per abandonment ahead of you. Reconciliation is the bounded, periodic
+  re-truth that stops that drift being permanent; the clamp makes the correction invisible when it
+  would otherwise show a position going up.
+- **On the event-loop clock, not the injected Clock:** the reconcile interval is a per-connection
+  local timer, not the cross-process admission rate, so `loop.time()` is correct and needs no
+  injection. The drift-correction *logic* is what's tested (`test_reconcile.py`), not the 30s cadence.
+- **Revisit when:** Phase 14 measures whether reconciliation corrects anything at load — a high
+  `qf_position_drift_total` means the abandonment rate is higher than design.md §6 assumes.
+
+## 2026-08-02 — Phase 12: Docker Compose, one origin via Caddy (the CORS hacks fall away)
+
+- **Chose:** `docker compose` runs Redis 7, Postgres 16, both services, and Caddy on one origin
+  (`http://localhost:8080`). Caddy serves the static frontend and reverse-proxies `/api/queue/*` →
+  queue and `/events|/admin|/static/*` → booking, with `flush_interval -1` on the queue routes so
+  SSE is not buffered (Caddy's form of `proxy_buffering off`, §8). Gunicorn arrives via a
+  `sys_platform != "win32"` marker, so the Windows dev box stays Uvicorn-only and the Linux image
+  gets the process manager.
+- **Rejected:** publishing each service's port to the host (the CORS problem returns); baking
+  secrets into the image (compose env with dev defaults + a root `.env` override); a build context
+  that copies the frontend into the queue image (Caddy serves it static instead).
+- **What one origin buys:** the Phase 9 hacks — the queue serving the page, `django-cors-headers`
+  on booking — are unnecessary here, because browser, queue API and booking API share the Caddy
+  origin. They stay for the non-Docker local flow (page on :8001, booking on :8000); the frontend
+  now picks its booking base URL from `location.port`.
+- **Verified end to end:** `make up` boots all five healthy (queue on Gunicorn + Uvicorn workers,
+  the first time it runs on Linux; booking migrates then serves), and the full join → admit → book
+  loop runs through :8080 and persists `booking_id 1` in the containerised Postgres.
+- **Two changes it forced:** booking's `DEBUG`/`ALLOWED_HOSTS` became env-driven (the container
+  must accept the host Caddy proxies under); the Makefile's `create-event` args were wrong until
+  the real command signature (`--rate-per-min/--burst/--batch-max`) was checked against `--help`.
+- **Parity note:** Postgres pinned to 16 here vs the dev box's native 18 — the gap logged
+  2026-07-18 is now closed for anything running via Docker.
+- **Revisit when:** deploying to AWS (§7) — same compose, a real domain, Caddy automatic TLS, and
+  `QUEUE_COOKIE_SECURE=1`.
+
+## 2026-08-02 — Phase 13: metrics in multiprocess mode, Prometheus + Grafana
+
+- **Chose:** prometheus-client in **multiprocess mode** — every Gunicorn worker and the admitter
+  write to a shared `PROMETHEUS_MULTIPROC_DIR`; `/metrics` aggregates with a `MultiProcessCollector`.
+  A `gunicorn.conf.py` clears stale files at startup and calls `mark_process_dead` on worker exit.
+  Prometheus scrapes `queue:8001/metrics` on the internal network (not through Caddy — /metrics is
+  not public); Grafana provisions the datasource + one dashboard, anonymous-admin for the demo.
+- **Rejected:** the default single-process registry — under Gunicorn's N workers each request hits
+  a random worker, so counts would be a fraction of the truth and gauges would flicker per scrape;
+  exposing `/metrics` through Caddy (Prometheus is on the internal network and it should not be
+  public).
+- **The metric→process map that made it work:** counters/histograms (`qf_admissions_total`,
+  `qf_admission_batch_seconds`) are written by the ADMITTER process and survive it ending — that is
+  the whole point of file-backed multiprocess counters, and it is what lets a separate admitter's
+  numbers appear in a web worker's `/metrics`. Gauges (`qf_sse_connections` livesum, `qf_queue_depth`
+  livemax) are written by the web workers and cleaned up on worker exit.
+- **Verified:** the admitter's `qf_admissions_total{event} = 1` appeared in a web worker's
+  `/metrics`; Prometheus reports the `queue` target `up` and the metric is queryable; Grafana is
+  healthy with the datasource + dashboard provisioned.
+- **`/metrics` reads files off disk**, so the async view runs the collection in a thread
+  (`sync_to_async`) — no blocking IO on the event loop (CLAUDE.md §4).
+- **Revisit when:** Phase 14 drives real load and the dashboard shows a full drop end to end;
+  `qf_redis_command_seconds` was deferred as the least essential of the §3.1 series.
