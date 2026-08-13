@@ -5,14 +5,17 @@ Django==5.1.15
 redis==6.4.0
 uvicorn[standard]==0.52.1
 
+# Metrics. Runs in multiprocess mode under Gunicorn (each worker + the admitter write to
+# PROMETHEUS_MULTIPROC_DIR; /metrics aggregates) — the fiddly setup CLAUDE.md §8 warns about.
+prometheus-client==0.21.1
+
 # Signs the HS256 admission passes the booking service verifies. Pinned to the SAME version the
 # booking service uses: the two are opposite ends of one credential, and a version skew in a JWT
 # library is exactly the kind of thing that fails silently on one side only.
 PyJWT==2.13.0
 
-# Deliberately NOT here yet:
-#   gunicorn  — POSIX only (it imports fcntl), so it cannot run on the Windows dev box. Locally
-#               we run a single Uvicorn process; the Gunicorn + UvicornWorker setup arrives with
-#               Docker in Phase 12, which is the first time this service runs on Linux.
-#   uvloop    — same reason; uvicorn[standard] already skips it on win32 via a platform marker,
-#               and picks it up automatically inside the Linux image.
+# Gunicorn manages the Uvicorn (ASGI) workers in the Linux image. It is POSIX-only (it imports
+# fcntl), so the platform marker skips it on the Windows dev box — where we run a single Uvicorn
+# process — and installs it inside the Docker image (Phase 12), the first time this service runs on
+# Linux. uvloop/httptools ride in the same way via uvicorn[standard]'s own win32 marker.
+gunicorn==23.0.0 ; sys_platform != "win32"

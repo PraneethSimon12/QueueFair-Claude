@@ -9,14 +9,59 @@ response. The atomicity lives in Lua, the arithmetic lives in core/, and neither
 business.
 """
 
+import asyncio
+import json
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+from asgiref.sync import sync_to_async
 from django.conf import settings
-from django.http import HttpRequest, JsonResponse
+from django.http import HttpRequest, HttpResponse, JsonResponse, StreamingHttpResponse
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    generate_latest,
+    multiprocess,
+)
 from redis.exceptions import RedisError
 
+from adapters.broadcaster import QUEUE_MAXSIZE, get_broadcaster
+from adapters.metrics import POSITION_DRIFT, SSE_CONNECTIONS
 from adapters.queue_repository import UnknownEvent, UnknownToken, get_queue_repository
 from adapters.redis_client import redis_is_healthy
-from core.state import AdmittedOutcome, state_from, state_from_admission, state_from_position
+from core.state import (
+    AdmittedOutcome,
+    PositionOutcome,
+    QueueState,
+    WaiterState,
+    clamp_position,
+    eta_seconds_for,
+    position_from,
+    state_from,
+    state_from_admission,
+    state_from_position,
+)
 from core.validation import is_valid_event_id, is_valid_queue_token, new_queue_token
+
+# The v0 waiting-room page, served by THIS service so the browser's join/position calls are
+# same-origin. The service is otherwise JSON/SSE only; it carries this one static page because its
+# MIDDLEWARE=[] invariant rules out putting CORS on it, so the page must share its origin. Read
+# once at import — never blocking file IO inside an async view (settings.py MIDDLEWARE note). In
+# production (Phase 12) Caddy serves the frontend and the `index` route is removed. Logged in
+# decisions.md, 2026-08-02.
+_INDEX_PATH = Path(settings.BASE_DIR).parent / "frontend" / "index.html"
+_INDEX_HTML = (
+    _INDEX_PATH.read_bytes()
+    if _INDEX_PATH.exists()
+    else b"<!doctype html><title>QueueFair</title><h1>frontend/index.html not found</h1>"
+)
+
+
+async def index(request: HttpRequest) -> HttpResponse:
+    """GET / — the vanilla waiting-room page (v0 dev only). See the note above for why it is here."""
+    if request.method != "GET":
+        return HttpResponse(status=405)
+    return HttpResponse(_INDEX_HTML, content_type="text/html; charset=utf-8")
 
 
 async def healthz(request: HttpRequest) -> JsonResponse:
@@ -31,6 +76,24 @@ async def healthz(request: HttpRequest) -> JsonResponse:
     if await redis_is_healthy():
         return JsonResponse({"status": "ok", "redis": "ok"})
     return JsonResponse({"status": "degraded", "redis": "unavailable"}, status=503)
+
+
+async def metrics(request: HttpRequest) -> HttpResponse:
+    """GET /metrics — Prometheus text format, aggregated across every worker process.
+
+    Multiprocess collection reads files from PROMETHEUS_MULTIPROC_DIR, so it runs in a thread
+    (sync_to_async) to keep blocking IO off the event loop (settings.py / CLAUDE.md §4).
+    """
+    if request.method != "GET":
+        return HttpResponse(status=405)
+    payload = await sync_to_async(_render_metrics)()
+    return HttpResponse(payload, content_type=CONTENT_TYPE_LATEST)
+
+
+def _render_metrics() -> bytes:
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    return generate_latest(registry)
 
 
 async def join(request: HttpRequest, event_id: str) -> JsonResponse:
@@ -123,6 +186,157 @@ async def position(request: HttpRequest, event_id: str) -> JsonResponse:
         return JsonResponse(body)
 
     return JsonResponse(state_from_position(outcome).as_dict())
+
+
+async def stream(request: HttpRequest, event_id: str) -> StreamingHttpResponse | JsonResponse:
+    """GET /api/queue/{event_id}/stream — the waiter's position, live, over SSE.
+
+    Replaces polling: one long-lived connection receives a `position` frame whenever an admission
+    batch moves the queue, and a final `admitted` frame carrying the pass. Anything knowable before
+    the stream opens is a normal HTTP status; once it is open the status line is already sent, so
+    there is nothing left to report but frames (build-plan §3.1).
+
+    Returns: 200 text/event-stream · 404 unknown_event / unknown_token · 405 · 503.
+    """
+    if request.method != "GET":
+        return JsonResponse({"detail": "method_not_allowed"}, status=405)
+    if not is_valid_event_id(event_id):
+        return JsonResponse({"detail": "unknown_event"}, status=404)
+
+    queue_token = _queue_token_from(request, event_id)
+    if queue_token is None:
+        return JsonResponse({"detail": "unknown_token"}, status=404)
+
+    # Resolve the waiter's situation ONCE, before opening the stream, so a bad token is a clean 404
+    # instead of a stream that opens and immediately dies.
+    try:
+        outcome = await get_queue_repository().position(event_id, queue_token)
+    except UnknownEvent:
+        return JsonResponse({"detail": "unknown_event"}, status=404)
+    except UnknownToken:
+        return JsonResponse({"detail": "unknown_token"}, status=404)
+    except RedisError:
+        return JsonResponse({"detail": "redis_unavailable"}, status=503)
+
+    response = StreamingHttpResponse(
+        _event_stream(event_id, queue_token, outcome),
+        content_type="text/event-stream",
+    )
+    response["Cache-Control"] = "no-cache"
+    # Without this a reverse proxy (Nginx/Caddy) buffers the response and the browser receives
+    # nothing until the stream ends — which for SSE is never (CLAUDE.md §8, build-plan §3.1).
+    response["X-Accel-Buffering"] = "no"
+    return response
+
+
+async def _event_stream(
+    event_id: str, queue_token: str, outcome: PositionOutcome | AdmittedOutcome
+) -> AsyncIterator[str]:
+    """The SSE body. Yields frames until the waiter is admitted or the browser disconnects.
+
+    Position is arithmetic on a pinned sequence (design.md §6), recomputed from each broadcast with
+    zero Redis per tick. Every SSE_RECONCILE_SECONDS the stream re-checks the authoritative ZRANK
+    and re-pins the sequence, correcting the drift abandonment introduces — the one per-connection
+    Redis cost of this path. The displayed position is clamped so a correction never moves it up.
+    """
+    # Tell EventSource to reconnect 3s after a drop, rather than its uncontrolled default.
+    yield "retry: 3000\n\n"
+
+    if isinstance(outcome, AdmittedOutcome):
+        # Already admitted at connect — hand over the pass and close. Nothing more to stream.
+        yield _frame("admitted", outcome.admission)
+        return
+
+    sequence = outcome.position + outcome.admitted_total
+    last_shown = outcome.position
+    admitted_total = outcome.admitted_total
+    total_waiting = outcome.total_waiting
+    rate_per_min = outcome.rate_per_min
+    yield _frame("position", state_from_position(outcome).as_dict())
+
+    broadcaster = get_broadcaster()
+    inbox: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+    broadcaster.register(event_id, inbox)
+    SSE_CONNECTIONS.inc()
+    monotonic = asyncio.get_running_loop().time
+    next_reconcile = monotonic() + settings.SSE_RECONCILE_SECONDS
+    try:
+        while True:
+            fresh = False
+            try:
+                update = await asyncio.wait_for(inbox.get(), timeout=settings.SSE_HEARTBEAT_SECONDS)
+                admitted_total = int(update["admitted_total"])
+                total_waiting = int(update["total_waiting"])
+                rate_per_min = int(update["rate_per_min"])
+                fresh = True
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"  # heartbeat: stop idle proxies dropping the connection
+
+            # Periodic reconciliation against the authoritative ZRANK. Re-pinning the sequence here
+            # corrects the abandonment drift the cheap arithmetic accumulates (design.md §6).
+            if monotonic() >= next_reconcile:
+                next_reconcile = monotonic() + settings.SSE_RECONCILE_SECONDS
+                truth = await _reconcile(event_id, queue_token)
+                if isinstance(truth, AdmittedOutcome):
+                    yield _frame("admitted", truth.admission)
+                    return
+                if isinstance(truth, PositionOutcome):
+                    if position_from(sequence, truth.admitted_total) != truth.position:
+                        POSITION_DRIFT.inc()  # the arithmetic had drifted; reconciliation fixed it
+                    sequence = truth.position + truth.admitted_total
+                    admitted_total = truth.admitted_total
+                    total_waiting = truth.total_waiting
+                    rate_per_min = truth.rate_per_min
+                    fresh = True
+
+            if not fresh:
+                continue  # a heartbeat with nothing new to report
+
+            if sequence <= admitted_total:
+                # Reached the front and been admitted — hand over the pass, then the stream is done.
+                truth = await _reconcile(event_id, queue_token)
+                if isinstance(truth, AdmittedOutcome):
+                    yield _frame("admitted", truth.admission)
+                    return
+                # Pass not visible yet (TTL race, or the known pop/sign gap in decisions.md) — keep
+                # streaming; the next broadcast or reconciliation resolves it.
+                continue
+
+            # Clamp so a reconciliation correction is never SHOWN moving the position up (FR-7).
+            last_shown = clamp_position(position_from(sequence, admitted_total), last_shown)
+            state = QueueState(
+                position=last_shown,
+                total_waiting=total_waiting,
+                admitted_total=admitted_total,
+                eta_seconds=eta_seconds_for(last_shown, rate_per_min),
+                state=WaiterState.WAITING,
+            )
+            yield _frame("position", state.as_dict())
+    finally:
+        # Runs on admission, on client disconnect (GeneratorExit) and on cancellation — so a closed
+        # browser tab always releases its slot in the fan-out and the connection gauge.
+        broadcaster.unregister(event_id, inbox)
+        SSE_CONNECTIONS.dec()
+
+
+def _frame(event: str, data: dict[str, object]) -> str:
+    """One SSE frame: an event name and a JSON data line, terminated by a blank line."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def _reconcile(
+    event_id: str, queue_token: str
+) -> PositionOutcome | AdmittedOutcome | None:
+    """The authoritative situation from Redis (ZRANK), or None on a transient failure.
+
+    Used both to correct drift periodically and to fetch the pass once the arithmetic says a waiter
+    has reached the front. A transient failure returns None so the stream keeps going on the last
+    known state rather than dropping the connection.
+    """
+    try:
+        return await get_queue_repository().position(event_id, queue_token)
+    except (UnknownEvent, UnknownToken, RedisError):
+        return None
 
 
 def _queue_token_from(request: HttpRequest, event_id: str) -> str | None:

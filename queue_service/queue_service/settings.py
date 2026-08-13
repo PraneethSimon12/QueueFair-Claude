@@ -150,3 +150,17 @@ ADMISSION_PASS_TTL_SECONDS = int(os.environ.get("ADMISSION_PASS_TTL_SECONDS", "6
 # admitted waiter waits to be told; ticking faster than the rate just produces empty batches at
 # one Redis call each.
 ADMISSION_TICK_SECONDS = float(os.environ.get("ADMISSION_TICK_SECONDS", "1.0"))
+
+
+# --- SSE ---------------------------------------------------------------------------------------
+
+# A ': ping' comment every this many seconds keeps proxies from dropping an idle connection
+# (CLAUDE.md §8). 15s is the conventional SSE heartbeat.
+SSE_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "15"))
+
+# How often each open stream re-checks the AUTHORITATIVE ZRANK to correct the position
+# arithmetic's abandonment drift (design.md §6; build-plan §5 budgets ~1 per connection per 30s).
+# This is the only per-connection Redis cost of the SSE path — everything else is in-memory
+# arithmetic — so it trades a small, bounded, predictable load for a position that cannot drift
+# without limit.
+SSE_RECONCILE_SECONDS = float(os.environ.get("SSE_RECONCILE_SECONDS", "30"))

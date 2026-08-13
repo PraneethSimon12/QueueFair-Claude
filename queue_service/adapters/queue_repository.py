@@ -16,6 +16,7 @@ from pathlib import Path
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
 
+from adapters.metrics import ADMISSIONS, ADMISSION_BATCH_SECONDS
 from core.keys import EventKeys
 from core.ports import AdmissionBatch, IssuedPass
 from core.state import AdmittedOutcome, JoinOutcome, PositionOutcome
@@ -153,10 +154,11 @@ class RedisQueueRepository:
                  event is not configured.
         """
         keys = EventKeys(event_id)
-        reply = await self._admit_batch(
-            keys=[keys.queue, keys.admitted, keys.bucket, keys.config],
-            args=[now_ms],
-        )
+        with ADMISSION_BATCH_SECONDS.time():
+            reply = await self._admit_batch(
+                keys=[keys.queue, keys.admitted, keys.bucket, keys.config],
+                args=[now_ms],
+            )
 
         if reply[0] == _STATUS_UNKNOWN_EVENT:
             return None
@@ -182,6 +184,11 @@ class RedisQueueRepository:
         The TTL is the pass's own lifetime, so the key cannot outlive the credential it holds.
         There is no cleanup path and there does not need to be one — that is the point of setting
         it here rather than reaping later.
+
+        Also ANNOUNCES the new admitted_total on the event's pub/sub channel (Phase 10). The
+        admission path is the only moment a waiter's position can drop, so it is where the SSE
+        fan-out is triggered; subscribers recompute every waiter's position in memory from the
+        broadcast integers (design.md §6), so this PUBLISH is fire-and-forget.
         """
         if not passes:
             return
@@ -200,7 +207,23 @@ class RedisQueueRepository:
                     ),
                     ex=ttl_seconds,
                 )
-            await pipe.execute()
+            # Read the announcement facts in the same round trip as the writes above.
+            pipe.get(keys.admitted)
+            pipe.zcard(keys.queue)
+            pipe.hget(keys.config, "rate_per_min")
+            results = await pipe.execute()
+
+        await self._redis.publish(
+            keys.channel,
+            json.dumps(
+                {
+                    "admitted_total": int(results[-3] or 0),
+                    "total_waiting": int(results[-2] or 0),
+                    "rate_per_min": int(results[-1] or 0),
+                }
+            ),
+        )
+        ADMISSIONS.labels(event=event_id).inc(len(passes))
 
 
 _repository: RedisQueueRepository | None = None

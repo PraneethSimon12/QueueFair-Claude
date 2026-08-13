@@ -94,6 +94,18 @@ def position_from(sequence: int, admitted_total: int) -> int:
     return max(1, sequence - admitted_total)
 
 
+def clamp_position(computed: int, last_shown: int) -> int:
+    """Never let a DISPLAYED position increase (FR-7 / fairness promise F4).
+
+    The arithmetic position only moves down as `admitted` grows, but a reconciliation against the
+    authoritative ZRANK could momentarily compute a higher number (an abandonment counted late, a
+    read straddling an admission batch). A position going UP is the one thing users notice and
+    never forgive, so the displayed value is pinned to its previous low even when the correction
+    disagrees. The corrected sequence is still kept internally — only what we SHOW is clamped.
+    """
+    return min(computed, last_shown)
+
+
 def eta_seconds_for(position: int, rate_per_min: int) -> int | None:
     """Roughly how long until this waiter is admitted, in seconds. None when unknowable.
 
