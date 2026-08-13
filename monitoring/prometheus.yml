@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  # Scrapes the queue service directly on the internal Docker network — /metrics is not exposed
+  # through Caddy, and should not be (it is not public).
+  - job_name: queue
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["queue:8001"]
