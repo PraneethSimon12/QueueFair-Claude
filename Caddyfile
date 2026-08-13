@@ -1,0 +1,30 @@
+# One origin for the whole system (http://localhost:8080). The queue and booking APIs are proxied;
+# the waiting-room page is served static. Because everything shares this origin, no CORS is needed.
+
+:80 {
+	# Queue API, including the SSE stream. flush_interval -1 disables response buffering so SSE
+	# frames reach the browser immediately — the Caddy equivalent of Nginx's `proxy_buffering off`
+	# (CLAUDE.md §8). Harmless for the small join/position responses.
+	handle /api/queue/* {
+		reverse_proxy queue:8001 {
+			flush_interval -1
+		}
+	}
+
+	# Booking service.
+	handle /events/* {
+		reverse_proxy booking:8000
+	}
+	handle /admin/* {
+		reverse_proxy booking:8000
+	}
+	handle /static/* {
+		reverse_proxy booking:8000
+	}
+
+	# Everything else: the vanilla waiting-room page (mounted at /srv).
+	handle {
+		root * /srv
+		file_server
+	}
+}

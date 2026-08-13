@@ -1,0 +1,95 @@
+# QueueFair — the whole system on one machine. `docker compose up --build` (or `make up`).
+# Caddy fronts everything on http://localhost:8080, so the browser, the queue API and the booking
+# API are one origin — which is why the Phase 9 CORS / serve-the-page hacks are not needed here.
+#
+# The ADMISSION_TOKEN_SECRET default is shared by both services on purpose: it is the two ends of
+# one credential and MUST match. All defaults here are dev-only — override them with a root .env
+# (see .env.example) before this runs anywhere real.
+
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: queuefair
+      POSTGRES_USER: queuefair
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-queuefair}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queuefair -d queuefair"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  queue:
+    build: ./queue_service
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-insecure-queue-key}
+      DJANGO_DEBUG: "0"                          # off under load, by this service's design
+      DJANGO_ALLOWED_HOSTS: "*"
+      REDIS_URL: redis://redis:6379/0
+      ADMISSION_TOKEN_SECRET: ${ADMISSION_TOKEN_SECRET:-dev-shared-admission-secret-change-me-32b}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  booking:
+    build: ./booking_service
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-dev-insecure-booking-key}
+      DJANGO_DEBUG: "1"
+      DJANGO_ALLOWED_HOSTS: "*"
+      DB_NAME: queuefair
+      DB_USER: queuefair
+      DB_PASSWORD: ${DB_PASSWORD:-queuefair}
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      ADMISSION_TOKEN_SECRET: ${ADMISSION_TOKEN_SECRET:-dev-shared-admission-secret-change-me-32b}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./frontend:/srv:ro                       # the waiting-room page, served static
+    depends_on:
+      - queue
+      - booking
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"                              # http://localhost:9090
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - queue
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"                              # http://localhost:3000 — anonymous admin, no login
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:
