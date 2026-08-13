@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QueueFair — Waiting Room</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 3rem auto; padding: 0 1rem;
+         line-height: 1.5; }
+  h1 { font-size: 1.4rem; margin-bottom: 0; }
+  #position { font-size: 4rem; font-weight: 700; margin: 0.1em 0; }
+  #position.stale { opacity: 0.4; }            /* dimmed while reconnecting — never blanked */
+  .muted { color: #8a8a8a; }
+  .card { border: 1px solid #8884; border-radius: 12px; padding: 1.5rem; margin-top: 1.5rem; }
+  .fair { font-size: 0.9rem; }
+  button { font-size: 1rem; padding: 0.6em 1.2em; border-radius: 8px; cursor: pointer; }
+  code { background: #8882; padding: 0.1em 0.35em; border-radius: 4px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+  <h1>🎟️ QueueFair</h1>
+  <p class="muted">Event: <code id="event"></code></p>
+
+  <!-- WAITING ------------------------------------------------------------------------------- -->
+  <div id="waiting" class="card hidden">
+    <div class="muted">Your position in line</div>
+    <div id="position">—</div>
+    <div id="detail" class="muted"></div>
+    <p class="fair">You are in a <strong>fair queue</strong> — everyone is admitted in the exact
+       order they arrived. Refreshing this page does <strong>not</strong> change your place.</p>
+    <p class="fair muted">The wait time is an estimate that updates as the queue moves — not a
+       countdown.</p>
+  </div>
+
+  <!-- ADMITTED ------------------------------------------------------------------------------ -->
+  <div id="admitted" class="card hidden">
+    <div>✅ <strong>It's your turn.</strong> Your pass is valid for about 60 seconds.</div>
+    <p><button id="book">Book my ticket</button></p>
+    <div id="bookResult" class="muted"></div>
+  </div>
+
+  <!-- TERMINAL / ERROR ---------------------------------------------------------------------- -->
+  <div id="terminal" class="card hidden"></div>
+
+  <script>
+  "use strict";
+
+  // --- config ---------------------------------------------------------------------------------
+  // This page is served BY the queue service (:8001), so its join/position calls are SAME-ORIGIN
+  // (relative URLs, no CORS). The booking service is a different origin (:8000): we call it with an
+  // absolute URL, and it allows this origin via CORS. Host is taken from the page so that opening
+  // via 127.0.0.1 or via localhost both work (either origin is allowed by the booking service).
+  const EVENT_ID   = new URLSearchParams(location.search).get("event") || "coldplay-mumbai-2026";
+  const QUEUE_BASE = "";                                       // same origin as this page
+  // Local dev serves this page from the queue service on :8001, so booking is a separate origin
+  // (:8000). Behind Caddy (any other port / a domain) everything is one origin, so booking is
+  // same-origin and the path stays relative.
+  const BOOK_BASE  = location.port === "8001" ? `${location.protocol}//${location.hostname}:8000` : "";
+
+  // --- state ----------------------------------------------------------------------------------
+  let queueToken        = null;      // from the join RESPONSE BODY — the cookie is HttpOnly, JS can't read it
+  let admissionPass     = null;      // held in MEMORY ONLY; it lives ~60s, persisting it gains nothing
+  let lastShownPosition = Infinity;  // clamp: we never render a position that went UP (§7 rule 5)
+  let stream            = null;      // the EventSource (SSE) — replaces the v0 poll (Phase 10)
+
+  // --- dom ------------------------------------------------------------------------------------
+  const $ = (id) => document.getElementById(id);
+  $("event").textContent = EVENT_ID;
+
+  function show(section) {   // exactly one card visible = the state machine, on screen
+    for (const id of ["waiting", "admitted", "terminal"]) {
+      $(id).classList.toggle("hidden", id !== section);
+    }
+  }
+
+  function renderWaiting(state, { stale = false } = {}) {
+    show("waiting");
+    // Never show the number increasing, even if a reconciliation nudged it up server-side
+    // (belt-and-braces — the server clamps too, §7 rule 5). Never blank on a hiccup — dim it.
+    const pos = Math.min(state.position, lastShownPosition);
+    lastShownPosition = pos;
+    $("position").textContent = pos.toLocaleString();
+    $("position").classList.toggle("stale", stale);
+    $("detail").textContent = stale
+      ? "Reconnecting…"
+      : `${state.total_waiting.toLocaleString()} waiting · ${etaText(state.eta_seconds)}`;
+  }
+
+  function etaText(seconds) {
+    if (seconds == null) return "estimate updating";   // paused drop -> null, NEVER "0" (§2)
+    const mins = Math.ceil(seconds / 60);
+    return mins <= 1 ? "about a minute left" : `about ${mins} minutes left`;
+  }
+
+  function terminal(html) {
+    closeStream();
+    show("terminal");
+    $("terminal").innerHTML = html;
+  }
+
+  // --- api ------------------------------------------------------------------------------------
+  async function join() {
+    // POST /join is idempotent and runs ONCE, on load. We never call it again to "refresh" — the
+    // position poll is for that (§7 rule 2); re-joining as a refresh is how a fairness bug is born.
+    let res;
+    try {
+      res = await fetch(`${QUEUE_BASE}/api/queue/${EVENT_ID}/join`, { method: "POST" });
+    } catch { return terminal("Can't reach the queue service — is it running on :8001?"); }
+    if (res.status === 404) return terminal("No such event.");
+    if (!res.ok)            return terminal(`Queue error (${res.status}).`);
+    const body = await res.json();
+    queueToken = body.queue_token;          // keep it — sent as ?t= on the stream URL
+    renderWaiting(body);
+    openStream();
+  }
+
+  // SSE: one long-lived connection. The browser's EventSource reconnects on its own (§7 rule 6),
+  // so there is no polling loop and no reconnection logic here — just handlers for the two frames.
+  function openStream() {
+    stream = new EventSource(`${QUEUE_BASE}/api/queue/${EVENT_ID}/stream?t=${queueToken}`);
+    stream.addEventListener("position", (e) => renderWaiting(JSON.parse(e.data)));
+    stream.addEventListener("admitted", (e) => {
+      admissionPass = JSON.parse(e.data).pass;   // memory only
+      closeStream();     // close first — the server ends the stream, and EventSource would otherwise reconnect
+      show("admitted");
+    });
+    stream.onerror = () => {
+      // Momentarily disconnected; the browser is already reconnecting. Dim the number, never blank
+      // it (a blank reads as a lost place). The first frame after reconnect is absolute truth.
+      $("position").classList.add("stale");
+      $("detail").textContent = "Reconnecting…";
+    };
+  }
+  function closeStream() { if (stream) { stream.close(); stream = null; } }
+
+  async function book() {
+    $("book").disabled = true;
+    $("bookResult").textContent = "Booking…";
+    let res;
+    try {
+      res = await fetch(`${BOOK_BASE}/events/${EVENT_ID}/book`, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${admissionPass}` },
+      });
+    } catch {
+      $("book").disabled = false;
+      $("bookResult").textContent = "Can't reach the booking service (:8000).";
+      return;
+    }
+    if (res.status === 201 || res.status === 200) {           // 201 new · 200 idempotent replay
+      const b = await res.json();
+      return terminal(`🎉 Booked! Confirmation <code>#${b.booking_id}</code>.`);
+    }
+    if (res.status === 401) {                                 // pass expired between admit and click
+      return terminal(`Your pass expired. <button onclick="location.reload()">Rejoin the queue</button>`);
+    }
+    if (res.status === 409) {                                 // SOLD OUT is terminal — do NOT requeue (§7)
+      return terminal("😔 Sold out — all tickets are gone.");
+    }
+    $("bookResult").textContent = `Booking failed (${res.status}).`;
+    $("book").disabled = false;
+  }
+
+  // --- go -------------------------------------------------------------------------------------
+  $("book").addEventListener("click", book);
+  join();
+  </script>
+</body>
+</html>
