@@ -52,9 +52,15 @@ SECRET_KEY = os.environ.get(
 )
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Env-driven so Docker can turn it off; defaults to True to preserve local `runserver` dev.
+DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
 
-ALLOWED_HOSTS = []
+# Env-driven so the container can accept the host Caddy proxies under. Default covers local dev.
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+    if host.strip()
+]
 
 
 # Application definition
@@ -68,11 +74,15 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     # Third-party
     'rest_framework',
+    'corsheaders',
     # Local apps
     'bookings',
 ]
 
 MIDDLEWARE = [
+    # Must sit above CommonMiddleware / anything that can generate a response, so a CORS preflight
+    # (OPTIONS) is answered before it. django-cors-headers is standard, async-safe plumbing here.
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -80,6 +90,15 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+
+# CORS: the vanilla frontend is served by the QUEUE service (:8001) and must be allowed to call
+# THIS service's /book endpoint cross-origin. Dev only, that one origin (both host spellings). In
+# production both services sit behind one origin (Caddy, Phase 12) and this can go away. No
+# credentials — the admission pass is a Bearer header, not a cookie.
+CORS_ALLOWED_ORIGINS = [
+    "http://127.0.0.1:8001",
+    "http://localhost:8001",
 ]
 
 ROOT_URLCONF = 'booking_service.urls'
