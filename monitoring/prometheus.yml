@@ -8,3 +8,11 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["queue:8001"]
+
+  # The booking service's request-latency histogram. This is the signal the queue service's dynamic
+  # backpressure loop reads (booking_request_seconds -> histogram_quantile p99). Same internal-only
+  # rule: scraped on the Docker network, never through Caddy.
+  - job_name: booking
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["booking:8000"]

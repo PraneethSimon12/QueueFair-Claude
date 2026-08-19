@@ -70,3 +70,45 @@ class PassIssuer(Protocol):
     def issue(self, event_id: str, queue_token: str, now_seconds: int) -> IssuedPass:
         """Sign one pass admitting `queue_token` to `event_id`."""
         ...
+
+
+class LatencySource(Protocol):
+    """Where the backpressure controller reads the booking service's health from.
+
+    The controller must never learn that the number comes from Prometheus, or over HTTP — it asks
+    for "the booking p99 in seconds" and gets a float or a None, and that is the whole contract.
+    That is what lets `BackpressureController` be tested against a fake that just returns scripted
+    numbers, with no Prometheus and no network (`tests/test_backpressure.py`).
+    """
+
+    async def booking_p99_seconds(self) -> float | None:
+        """The booking service's current p99 request latency in seconds.
+
+        Returns None when the signal is unavailable — the metric store is unreachable, or has no
+        data in the window yet. None is a first-class value here, not an error: the control law
+        (core/backpressure.py) treats it as "hold, do not probe up blind", so the source returning
+        None must mean exactly that and never be conflated with "p99 is 0".
+        """
+        ...
+
+
+class RateStore(Protocol):
+    """How the backpressure controller reads and writes the admission rate it tunes.
+
+    Read as well as write, on purpose: the controller re-reads the current rate every tick rather
+    than remembering what it last wrote. That keeps it stateless (a restart resumes cleanly) and
+    lets a human operator's manual `HSET` be picked up rather than stomped — the controller and the
+    operator drive the same knob (FR-13).
+    """
+
+    async def get_rate(self, event_id: str) -> int | None:
+        """The event's current admission rate (`rate_per_min` from its config hash), or None if the
+        event has no config — i.e. it does not exist. None lets the loop distinguish "unknown
+        event" from "rate is 0" (a paused-but-real drop)."""
+        ...
+
+    async def set_rate(self, event_id: str, rate_per_min: int) -> None:
+        """Set the event's admission rate. Takes effect on the very next admit_batch.lua tick,
+        which re-reads config every time — that live reload is the FR-13 knob this controller now
+        drives in place of a human."""
+        ...

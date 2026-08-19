@@ -164,3 +164,45 @@ SSE_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", "15"))
 # arithmetic — so it trades a small, bounded, predictable load for a position that cannot drift
 # without limit.
 SSE_RECONCILE_SECONDS = float(os.environ.get("SSE_RECONCILE_SECONDS", "30"))
+
+
+# --- Dynamic backpressure (v2) -----------------------------------------------------------------
+
+# The control loop (core/backpressure.py, run via run_backpressure) auto-tunes each event's
+# rate_per_min to hold the booking service's p99 near the target below. It is the automated
+# operator FR-13's live knob was built for. All read once here; nothing on the SSE hot path reads
+# any of it.
+
+# The booking-latency SLO the controller defends, in seconds. design.md §13 targets p99 < 200ms.
+BACKPRESSURE_TARGET_P99_SECONDS = float(os.environ.get("BACKPRESSURE_TARGET_P99_SECONDS", "0.2"))
+
+# The bounds the controller may never step outside. rate_min is the trickle that guarantees the
+# queue still drains under sustained overload — set it to 0 only if you intend overload to be able
+# to pause the drop entirely. rate_max is the operator's absolute ceiling.
+BACKPRESSURE_RATE_MIN = int(os.environ.get("BACKPRESSURE_RATE_MIN", "10"))
+BACKPRESSURE_RATE_MAX = int(os.environ.get("BACKPRESSURE_RATE_MAX", "600"))
+
+# AIMD knobs. Additive increase: reclaim capacity slowly when healthy (probe for headroom).
+# Multiplicative decrease: shed load fast on overload. The asymmetry is the whole point — see
+# core/backpressure.py and decisions.md (2026-08-13).
+BACKPRESSURE_INCREASE_STEP = int(os.environ.get("BACKPRESSURE_INCREASE_STEP", "20"))
+BACKPRESSURE_DECREASE_FACTOR = float(os.environ.get("BACKPRESSURE_DECREASE_FACTOR", "0.5"))
+
+# How often the loop runs. Deliberately slower than ADMISSION_TICK_SECONDS: a rate change must take
+# effect and show up in the p99 before the loop reacts again, or it oscillates chasing its own echo.
+BACKPRESSURE_INTERVAL_SECONDS = float(os.environ.get("BACKPRESSURE_INTERVAL_SECONDS", "10"))
+
+# Where the p99 comes from, and the PromQL that computes it from the booking histogram. The query
+# is over a 1-minute rate window so a brief spike does not swing the controller, but a sustained one
+# does. Overridable so the same loop can point at a different metric store or window.
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://127.0.0.1:9090")
+BACKPRESSURE_P99_QUERY = os.environ.get(
+    "BACKPRESSURE_P99_QUERY",
+    "histogram_quantile(0.99, sum(rate(booking_request_seconds_bucket[1m])) by (le))",
+)
+
+# Bounded, like the Redis timeouts: a hung Prometheus must surface as "no signal" (-> HOLD), not as
+# a control loop that blocks forever holding a stale rate.
+BACKPRESSURE_PROMETHEUS_TIMEOUT_SECONDS = float(
+    os.environ.get("BACKPRESSURE_PROMETHEUS_TIMEOUT_SECONDS", "2.0")
+)

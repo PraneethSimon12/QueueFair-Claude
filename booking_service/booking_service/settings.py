@@ -80,6 +80,9 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # Outermost, so it times the whole stack below it — the p99 the backpressure loop reads is the
+    # full request, not just the view. It early-returns on /metrics so the scrape is not self-timed.
+    'bookings.metrics.BookingMetricsMiddleware',
     # Must sit above CommonMiddleware / anything that can generate a response, so a CORS preflight
     # (OPTIONS) is answered before it. django-cors-headers is standard, async-safe plumbing here.
     'corsheaders.middleware.CorsMiddleware',

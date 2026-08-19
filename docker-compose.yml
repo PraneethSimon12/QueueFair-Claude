@@ -37,6 +37,9 @@ services:
       DJANGO_ALLOWED_HOSTS: "*"
       REDIS_URL: redis://redis:6379/0
       ADMISSION_TOKEN_SECRET: ${ADMISSION_TOKEN_SECRET:-dev-shared-admission-secret-change-me-32b}
+      # For the dynamic-backpressure loop (run_backpressure): where to read the booking p99 from.
+      # On the internal network Prometheus is at prometheus:9090, not localhost.
+      PROMETHEUS_URL: http://prometheus:9090
     depends_on:
       redis:
         condition: service_healthy
@@ -76,6 +79,7 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     depends_on:
       - queue
+      - booking
 
   grafana:
     image: grafana/grafana:latest

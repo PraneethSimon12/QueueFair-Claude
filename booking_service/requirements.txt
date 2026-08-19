@@ -7,6 +7,9 @@ djangorestframework==3.16.1
 psycopg[binary]==3.3.4
 PyJWT==2.13.0
 django-cors-headers==4.9.0
+# The booking p99 the queue service's backpressure loop reads (metrics.py). multiprocess mode is
+# used under gunicorn -w 4, same as the queue service.
+prometheus-client==0.21.1
 # WSGI server for the Linux image (Phase 12). POSIX-only, so the marker skips it on the Windows
 # dev box, where `runserver` is used instead.
 gunicorn==23.0.0 ; sys_platform != "win32"
