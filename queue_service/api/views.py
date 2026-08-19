@@ -28,7 +28,10 @@ from redis.exceptions import RedisError
 from adapters.broadcaster import QUEUE_MAXSIZE, get_broadcaster
 from adapters.metrics import POSITION_DRIFT, SSE_CONNECTIONS
 from adapters.queue_repository import UnknownEvent, UnknownToken, get_queue_repository
+from adapters.rate_limiter import get_rate_limiter
 from adapters.redis_client import redis_is_healthy
+from core.clientid import client_id_from
+from core.keys import EventKeys
 from core.state import (
     AdmittedOutcome,
     PositionOutcome,
@@ -116,6 +119,34 @@ async def join(request: HttpRequest, event_id: str) -> JsonResponse:
         # Same 404 as an event that does not exist. A malformed id and an unknown one are the
         # same thing to a client, and separating them would leak which events exist.
         return JsonResponse({"detail": "unknown_event"}, status=404)
+
+    # Abuse gate (v2), config-gated: bound how fast one client can hit join, before doing any work —
+    # minting a token and touching the queue for a flood is exactly what this prevents. Counts every
+    # join request per (event, client). Disabled when JOIN_RATE_LIMIT <= 0 (an operator kill-switch,
+    # and the default), so a deployment that has not tuned a limit pays nothing and behaves exactly
+    # as it did before this existed. The client id trusts X-Forwarded-For only behind a proxy
+    # (TRUST_PROXY) — see core/clientid.py for why the wrong end of that header is a bypass.
+    if settings.JOIN_RATE_LIMIT > 0:
+        client_id = client_id_from(
+            request.META.get("REMOTE_ADDR", ""),
+            request.META.get("HTTP_X_FORWARDED_FOR"),
+            trust_proxy=settings.TRUST_PROXY,
+        )
+        try:
+            limit = await get_rate_limiter().check(
+                EventKeys(event_id).join_rate(client_id),
+                settings.JOIN_RATE_LIMIT,
+                settings.JOIN_RATE_WINDOW_SECONDS,
+            )
+        except RedisError:
+            # Fail closed: Redis is the whole state store, so join cannot succeed without it anyway
+            # (the call below would 503 too). Reporting it here keeps the limiter from masking the
+            # outage as a spurious 429.
+            return JsonResponse({"detail": "redis_unavailable"}, status=503)
+        if not limit.allowed:
+            response = JsonResponse({"detail": "rate_limited"}, status=429)
+            response["Retry-After"] = str(limit.retry_after_seconds)
+            return response
 
     # A malformed token is treated as no token at all, and the waiter is minted a fresh one.
     # Join is the entry point to the system: answering the front door with a 404 because the

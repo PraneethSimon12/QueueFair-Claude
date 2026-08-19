@@ -57,6 +57,16 @@ class EventKeys:
         """Pub/sub channel for admission announcements. A channel, not a key."""
         return f"{NAMESPACE}:{self.event_id}:events"
 
+    def join_rate(self, client_id: str) -> str:
+        """The fixed-window join-rate counter for one client on this event (rate_limit.lua).
+
+        Per-(event, client), not global: the abuse it bounds — flooding *this* drop's queue — is
+        per-event, and keying it per-event lets one IP legitimately queue for several events. The
+        client_id may be an IPv6 address and so may contain ':'; that is harmless as a leaf value
+        (Redis keys are binary-safe) and cannot collide with the fixed prefixes above.
+        """
+        return f"{NAMESPACE}:{self.event_id}:joinrate:{client_id}"
+
     def pass_for(self, queue_token: str) -> str:
         """Where an issued admission pass waits to be collected by its holder.
 

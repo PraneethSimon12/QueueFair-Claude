@@ -206,3 +206,27 @@ BACKPRESSURE_P99_QUERY = os.environ.get(
 BACKPRESSURE_PROMETHEUS_TIMEOUT_SECONDS = float(
     os.environ.get("BACKPRESSURE_PROMETHEUS_TIMEOUT_SECONDS", "2.0")
 )
+
+
+# --- Abuse mitigation (v2) ---------------------------------------------------------------------
+
+# Per-(event, client) join rate limit (rate_limit.lua). Caps how fast one client can create queue
+# entries — bounding a single-source flood (inflating the queue, exhausting Redis) and multi-identity
+# slot-fishing. It does NOT stop a botnet with many IPs; that is defense in depth, not a silver
+# bullet. When a limit IS set it should be generous: a legitimate join fires once on page load and
+# reconnection is the SSE stream's job, not join's, so a real user never approaches it; and behind a
+# NAT or corporate proxy many users share one IP.
+#
+# DEFAULT 0 = DISABLED (the operator kill-switch). Rate limiting is an operational control whose
+# right value depends on expected traffic and NAT topology, so it is off until a deployment sets it
+# — the Docker compose enables it (30/min). Off, the join path behaves exactly as before this
+# existed and touches no rate-limit state, which is also why the existing test suite is unaffected.
+JOIN_RATE_LIMIT = int(os.environ.get("JOIN_RATE_LIMIT", "0"))
+JOIN_RATE_WINDOW_SECONDS = int(os.environ.get("JOIN_RATE_WINDOW_SECONDS", "60"))
+
+# Whether a trusted reverse proxy (Caddy) sits in front. If so, the client IP is the rightmost
+# X-Forwarded-For hop, not REMOTE_ADDR (which would be the proxy — every client identical). MUST be
+# 0 when the service is directly exposed: X-Forwarded-For is client-settable, and trusting it with
+# no proxy in front lets an abuser dodge the limit by rotating the header (core/clientid.py). 1 in
+# the Docker/Caddy deployment; 0 for local direct dev.
+TRUST_PROXY = os.environ.get("TRUST_PROXY", "0") == "1"

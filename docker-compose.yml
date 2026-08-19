@@ -40,6 +40,12 @@ services:
       # For the dynamic-backpressure loop (run_backpressure): where to read the booking p99 from.
       # On the internal network Prometheus is at prometheus:9090, not localhost.
       PROMETHEUS_URL: http://prometheus:9090
+      # Caddy sits in front here, so the real client IP is the rightmost X-Forwarded-For hop, not
+      # REMOTE_ADDR (which would be Caddy). Safe to trust XFF only because a trusted proxy is present.
+      TRUST_PROXY: "1"
+      # Enable the join rate limit in the deployed stack (off by default; see settings.py). 30 joins
+      # per minute per client IP — a human joins once, so this only bites a flood.
+      JOIN_RATE_LIMIT: "30"
     depends_on:
       redis:
         condition: service_healthy
