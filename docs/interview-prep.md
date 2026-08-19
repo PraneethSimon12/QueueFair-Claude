@@ -634,3 +634,124 @@ without the code, is one question away from ending an interview.
 middleware". They are validated by a **DRF authentication class** — and `decisions.md` records
 middleware being considered and *rejected*. An interviewer reading the decision log would have
 found the candidate claiming the thing the candidate had rejected.
+
+---
+
+## Load testing & measurement
+
+### Q: L1 shows opening an SSE connection costs ~6 Redis commands but *holding* it costs ~0 per tick, flat from 500 to 3,000 connections. During a real ticket drop, admissions fire every second. Does the steady state stay flat then — and if the box falls over at some N, what actually ran out?
+
+**Model answer — two parts, and the interviewer wants both.**
+
+**(1) Does it stay flat when admissions are firing?** *Redis* stays flat; *CPU* does not. When an
+admission batch commits, the admitter does **one** `PUBLISH` on `qf:{event}:events`. The one
+per-process subscriber receives that single message and fans it out to every connected client's
+in-memory `asyncio.Queue` — **zero extra Redis commands per client.** So Redis command volume is
+driven by *admission rate*, not by *connection count*: 600 admissions/min is ~10 `PUBLISH`/sec
+whether 500 or 50,000 people are watching. What *does* scale with connection count is the
+in-process fan-out: N `asyncio.Queue.put` calls and N position recomputations per message, on the
+event loop's single core. That is the honest answer to "what's the bottleneck" — it is CPU in the
+Python process fanning out, not Redis.
+
+**One caveat I must state, or the "flat" claim is a small lie:** the 12 s L1 hold is shorter than
+the 30 s reconciliation interval, so it measured the *between-reconcile* floor. Every 30 s each
+connection does one authoritative `ZRANK` to correct abandonment drift — so Redis steady-state is
+not literally zero, it is ~`N/30` ZRANK/sec (bounded, deliberate, design.md §6). Still flat *per
+tick*; not flat *forever*.
+
+**(2) What runs out first at the ceiling?** In rough order as N climbs: (a) **event-loop CPU** —
+one core doing all the fan-out and heartbeat writes; this is why the real config is Gunicorn 4–6
+workers, to get 4–6 cores. (b) **File descriptors / memory per connection** — each open SSE
+response is a socket plus a bounded queue plus Python object overhead; RSS ÷ N is the number L1
+did *not* measure and R7 still needs. (c) **`somaxconn` / ephemeral ports** during the *ramp*, not
+the hold — a harness limit, not a system one. Redis `maxclients` (default 10,000) is *not* in this
+list, and that is the whole point of one subscription per process: the naive one-connection-per-
+client design dies there at 10K; this design never opens more than a handful of Redis connections.
+
+**Why this is the strong version of the answer:** it separates the two cost axes (admission rate
+vs connection count), names which resource each pressures (Redis vs CPU/memory), states the
+reconcile caveat instead of hiding it, and explains why the design sidesteps the one Redis limit
+(`maxclients`) that kills the naive approach.
+
+---
+
+## Dynamic backpressure (v2)
+
+### Q: You run as many admitters as you like with no leader and no lock, and you say that's safe. But the backpressure controller must be a *single* instance. Why is one leaderless and the other not — isn't that a contradiction?
+
+**No — and the difference is the whole lesson of the project applied twice.**
+
+The admitter is safe to run N-wide because its critical operation — "check the rate budget AND pop
+that many waiters" — is **one atomic Lua script** (`admit_batch.lua`). Two admitters that wake at
+the same instant do not both read "100 tokens" and both pop: Redis runs each EVALSHA to completion
+before the next starts, so the second sees the bucket the first already drained. The atomicity is
+*inside* the operation, so no coordination is needed *around* it. That is design.md §7: making the
+operation atomic removes the need to make the actor exclusive.
+
+The backpressure controller has no such atomic step. Its logic is a **read-modify-write**: read
+`rate_per_min`, apply AIMD, write the new value back — three separate Redis operations with the
+control decision in between, in Python, not in a script. Two controllers would interleave exactly
+the way the naive queue-jumping join did: controller A reads 400, controller B reads 400, A sees
+overload and writes 200, B sees health and writes 420 — A's backoff is silently erased, and now
+they fight. Worse, it is a *control loop*: two controllers driving the same knob don't just race,
+they oscillate, because each reacts to a state the other is also changing.
+
+So the honest rule is: **atomicity where you can get it, exclusivity where you can't.** The admitter
+gets atomicity for free from Lua, so it needs no leader. The controller can't express its
+read-decide-write as one atomic step (the decision is application logic), so the cheap correct
+answer is to run one of them. If I ever needed several — I don't, one control loop is plenty — I
+would have to add back exactly the coordination the admitter was designed to avoid: a lock, a lease,
+or a leader election. That contrast, the same system needing opposite answers for two loops, is the
+point.
+
+**Two follow-ups they'll pull, and the short answers:**
+- *"Why AIMD and not a proportional controller?"* The cost of the two error directions isn't
+  symmetric — over-admitting is an outage of the thing I'm protecting, under-admitting is a slightly
+  longer wait — so I want asymmetric response: cut hard on overload (multiplicative), reclaim gently
+  (additive). Proportional control is symmetric and oscillates on noisy p99; PID's gains can't be
+  honestly tuned in a project this size.
+- *"Prometheus goes down mid-spike — does the rate keep climbing?"* No. A missing p99 is treated as
+  "hold", never "healthy". `next_rate(rate, None, cfg)` returns the current rate; it never increases
+  without a live signal, because raising load on a service you can no longer see is how you melt it.
+  It doesn't back off on a blip either — a monitoring gap isn't a booking outage. Verified live:
+  with Prometheus down, one control step read 600 and held at 600 with no write.
+
+---
+
+## Abuse mitigation (v2)
+
+### Q: Your join rate limit keys on the client IP, taken from X-Forwarded-For. Which end of that header do you trust, and what exactly breaks if you pick the other one?
+
+**The rightmost hop — the one the proxy appended — and picking the leftmost hands an attacker a
+free bypass.**
+
+X-Forwarded-For is a *request header*, so the client can send whatever it likes in it. When the
+request passes through our one trusted proxy (Caddy), Caddy **appends** the address it actually
+received the connection from. So with a single proxy the header reads
+`"<whatever the client typed>, <the client's real IP>"` and the **last** element is the only one a
+trusted machine vouched for. The leftmost element is the "original client" the header *claims* to
+be — and it is fully attacker-controlled.
+
+If I keyed the limit on the leftmost value, an abuser would send a different fake
+`X-Forwarded-For` on every request — `1.1.1.1`, `2.2.2.2`, … — and each would look like a brand-new
+client with a fresh budget. The limit would count to one and reset forever; it would be decorative.
+Keying on the rightmost hop counts every one of those requests against the abuser's real IP, which
+is the whole point.
+
+**The other half of the answer — why there's a `TRUST_PROXY` flag:** the rightmost rule is only
+safe *because* a trusted proxy is in front adding that last hop. If the service were exposed
+directly, there is no trusted appender — the entire header, rightmost included, is the client's to
+forge — so `TRUST_PROXY=False` makes the limiter ignore XFF entirely and key on the real transport
+peer (`REMOTE_ADDR`). Reading XFF on a directly-exposed service is the same spoof bug wearing a
+different hat. (For N chained trusted proxies you'd take the (N+1)th from the right; we run one.)
+
+**What it deliberately does NOT solve** (say this before they ask): a botnet with thousands of real
+IPs sails through — each IP has its own budget — and a corporate NAT makes many innocent users
+share one. So the limit is generous and this is defense in depth against the cheap single-source
+flood, not a defense against a distributed attacker. Stopping that needs a different signal:
+proof-of-work, a device fingerprint, or binding a place in line to an authenticated account.
+
+**Bonus — why the counter is one Lua script:** the limiter is `INCR` plus, on the first hit of a
+window, `EXPIRE`. Split across two round trips, a crash between them leaves a counter with no TTL —
+it never resets and throttles that client forever. One script makes INCR-and-set-expiry-if-new
+atomic. It's admit_batch.lua's lesson in miniature.

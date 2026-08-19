@@ -16,7 +16,7 @@
 > concepts, ask what I already know, teach the gaps, get a yes. A written plan is not consent to
 > skip the teaching — it is what we teach *from*.
 
-**Status:** Phases 0–13 built — metrics + Prometheus/Grafana · Phase 14 (k6 load tests) next
+**Status:** Phases 0–13 built · Phase 14: L1/L2/L3 in loadtest-report.md · **all three v2 picks done** — dynamic backpressure (closed loop MEASURED), abuse mitigation (tested + deployed), horizontal scaling (stateless, MEASURED) — k6 / multi-box / p99-latency runs still ⏳
 **Last updated:** 2026-08-02
 
 ---
@@ -628,11 +628,63 @@ The numbers. Raise `ulimit -n` and `somaxconn` **first** (CLAUDE.md §8). Every 
 **Done when:** `design.md` §13's table has real numbers instead of ⏳ — and
 [`resume-claims.md`](resume-claims.md) can be updated with numbers that actually happened.
 
+**Status: first run done (partial).** L1 in [`loadtest-report.md`](loadtest-report.md) is a local
+single-process *floor* run using a hand-rolled asyncio client (`loadtest/load.py`, no k6 yet): it
+proved the design.md §6 headline — steady-state Redis command volume flat (3) across 500 → 3,000
+held SSE connections — plus a 3,000-connection floor and ~526 join req/s on one uvicorn worker.
+**Still ⏳:** k6 proper; the Linux/Gunicorn multi-worker run with §2 preconditions applied; R8
+(end-to-end position p99, needs synced clocks); R9 (heartbeat cost); R12 (Django-vs-Starlette
+overhead). `design.md` §13 still has ⏳ rows for everything L1 did not cover.
+
 ### Phase 15+ — v2, pick three not all
 
 Horizontal scaling behind Nginx (sticky vs stateless — `design.md` §9 already argues it) ·
 Redis Sentinel failover during a live load test · dynamic backpressure keyed to booking p99 ·
 abuse mitigation where reconnecting cannot improve position.
+
+**v2 pick #1 — dynamic backpressure: BUILT (2026-08-13), live loop pending.** An AIMD controller
+(`core/backpressure.py`) auto-tunes each event's `rate_per_min` to hold the booking service's p99
+near an SLO. Two new surfaces:
+
+- **`python manage.py run_backpressure <event>`** (queue service) — the control loop. Run exactly
+  ONE instance per event (unlike `run_admitter`, which is leaderless). `--once` for a single step,
+  `--interval` to override the tick. Reads the p99 from Prometheus (`PROMETHEUS_URL`), writes the
+  rate to the config hash; a missing signal holds the rate rather than probing up.
+- **`GET /metrics`** (booking service) — a Prometheus `Histogram` `booking_request_seconds`, the
+  p99 the loop reads. Multiprocess-mode under `gunicorn -w 4`, default registry on the dev server.
+  Internal-only, scraped on the Docker network (`monitoring/prometheus.yml` now has a `booking` job).
+
+**Done:** 24 unit tests (control law + Prometheus parser + orchestration); both services `check`
+clean; booking `/metrics` records real request latency; the no-signal HOLD path on the live command.
+**Closed loop now MEASURED live (L2 in loadtest-report.md):** on the full Docker stack the controller
+drove the real admission rate from a real Prometheus booking p99 in both directions (overload
+600→10, healthy 10→150) — with the honest caveat that overload was induced via the target, not real
+booking saturation. **Still nice-to-have:** a Grafana panel for `rate_per_min` over time; a genuinely
+slow booking path to drop the caveat. Rationale: `decisions.md` (2026-08-13); design: `design.md` §7.
+
+**v2 pick #2 — abuse mitigation: BUILT & fully verified (2026-08-13).** Two guarantees: reconnecting
+/ manufacturing identities cannot improve your position (join.lua, now *proven* by tests), and a
+per-(event, client) fixed-window **join rate limit** (`lua/rate_limit.lua`) bounding a single-source
+flood. New wire behaviour:
+
+- **`POST /api/queue/{event}/join` may now return `429 rate_limited`** with a `Retry-After` header,
+  when the client exceeds `JOIN_RATE_LIMIT` joins per `JOIN_RATE_WINDOW_SECONDS`. Only when enabled.
+- **Config-gated:** `JOIN_RATE_LIMIT` (0 = disabled, the default; compose sets 30), plus
+  `JOIN_RATE_WINDOW_SECONDS` and `TRUST_PROXY` (whether the client IP is the rightmost
+  X-Forwarded-For hop). Off, join behaves exactly as before.
+
+**Done (all tests green, including offline):** 9 client-id unit tests (the XFF spoof rule) + 7
+integration tests (enforcement, 429+Retry-After, per-client isolation, disabled-mode, reconnect
+immunity), and the 16 existing join tests unaffected. Rationale, the XFF trap, and the honest
+botnet/NAT limitation: `decisions.md` (2026-08-13); design: `design.md` §5.
+
+**v2 pick #3 — horizontal scaling: MEASURED (L3, 2026-08-13).** Ran 3 queue replicas
+(`docker compose up -d --scale queue=3`) behind Caddy load-balancing (`dynamic a` + round-robin).
+Demonstrated the stateless property: 18 requests distributed 6/6/6, and one admission from a single
+admitter reached SSE streams on all three replicas (2/2/2 — cross-replica pub/sub fan-out). Found and
+fixed the sticky default (`reverse_proxy queue:8001` pins to one replica). No throughput number (3
+replicas share one laptop). Reproduce with `loadtest/demo_sse_scale.py`. Details: `decisions.md`
+(2026-08-13), `design.md` §9, `loadtest-report.md` L3.
 
 ---
 

@@ -51,9 +51,15 @@ A navigation aid, grouped by area (entries stay chronological below). Ctrl-F the
 - Phase 12: Docker Compose, one origin via Caddy (the CORS hacks fall away)
 - Phase 13: metrics in multiprocess mode, Prometheus + Grafana
 
+**v2 — dynamic backpressure, abuse mitigation & horizontal scaling**
+- Dynamic backpressure: an AIMD controller that tunes the admission rate to booking p99
+- Abuse mitigation: a config-gated per-client join rate limit, and the XFF trap
+- Horizontal scaling: load-balance across replicas with Caddy dynamic upstreams
+
 **Cross-cutting & findings**
 - A five-document spec set, with a claim-to-evidence ledger
 - Finding: localhost→Redis connect takes ~2s here, at the connect-timeout edge
+- Phase 14 first run: a hand-rolled asyncio load client, and a local floor
 
 ---
 
@@ -634,3 +640,158 @@ to be wrong is worse than none (`docs/index.md`).
   (`sync_to_async`) — no blocking IO on the event loop (CLAUDE.md §4).
 - **Revisit when:** Phase 14 drives real load and the dashboard shows a full drop end to end;
   `qf_redis_command_seconds` was deferred as the least essential of the §3.1 series.
+
+## 2026-08-13 — Phase 14 first run: a hand-rolled asyncio load client, and a local floor
+
+- **Chose:** measure the design.md §6 headline **now**, locally, with a ~150-line pure-asyncio
+  client (`loadtest/load.py`) instead of waiting for k6 + AWS. It has two modes: `join` (throughput
+  + latency percentiles) and `sse` (open M connections, hold, and diff Redis `INFO commandstats`
+  around the open phase and the steady-hold phase separately). The point of the two-phase split is
+  to price the two costs apart honestly: opening is O(connections), holding should be ~0/tick.
+- **Rejected (for now):** k6 (not installed locally, and it would still be measuring one Windows
+  box); a Linux/Gunicorn multi-worker run (that is the *next* run, not this one); trusting the
+  §6 claim without a number (CLAUDE.md Rule 7 forbids it).
+- **What it proved (L1 in `loadtest-report.md`):** steady-state Redis command volume is **flat (3)
+  at 500, 1,500 and 3,000 held SSE connections** — position is arithmetic in memory, so holding a
+  connection costs ~0 Redis calls per tick. Opening costs **~6 Redis commands per connection**
+  (one `position.lua` EVALSHA + its 5 internal calls, which `commandstats` counts separately) —
+  linear, as predicted. 3,000 connections held with 0 failures on **one uvicorn worker**; join
+  ~526 req/s, p99 631 ms.
+- **What it explicitly is NOT:** a ceiling. The load generator ran on the same box as the server
+  (§2 says this caps absolute numbers), it was a single uvicorn process (not the Gunicorn 4–6), and
+  none of the Linux fd/somaxconn tuning applied. So 3,000 is a **floor**; the flatness is the real,
+  transferable result. This distinction is written into the report so the number cannot be quoted
+  without its caveat.
+- **One tooling bug it surfaced:** the client first labelled open cost "~1 each (the ZRANK)"; the
+  measured 6.0/connection disproved that, and the label was corrected to name the EVALSHA + all
+  five internal calls. A load client that lies about what it measured is worse than none.
+- **Revisit when:** k6 is installed / the stack runs on Linux under Gunicorn / a second box drives
+  load — then R8–R12 (multi-worker, multi-box, end-to-end p99, heartbeat cost, Django-vs-Starlette)
+  become measurable, and the ⏳ rows in `design.md` §13 can start to fill.
+
+## 2026-08-13 — Dynamic backpressure: an AIMD controller that tunes the admission rate to booking p99
+
+- **Chose:** a control loop (`core/backpressure.py`, run via `run_backpressure`) that reads the
+  booking service's p99 and adjusts each event's `rate_per_min` to hold it near an SLO. The control
+  law is **AIMD** — additive increase when healthy, multiplicative decrease on overload — the same
+  law TCP uses for congestion control. It writes nothing new on the hot path: `admit_batch.lua`
+  already re-reads `rate_per_min` every tick (FR-13, built in Phase 8 for a *human* operator), so
+  the controller simply becomes the automated operator. Zero change to the admission hot path.
+- **Rejected — proportional control** (`rate * target/observed`): reacts symmetrically to a signal
+  whose cost is asymmetric (overload is an outage, slowness is an annoyance) and oscillates on noisy
+  p99. **Rejected — PID**: more capable but its gains cannot be honestly defended in a portfolio
+  project ("why Kd = 0.3?"). AIMD has two intuitive knobs and converges to a stable sawtooth.
+- **Where the p99 comes from:** the booking service now records request latency in a Prometheus
+  `Histogram` (`booking_request_seconds`) and exposes `/metrics`; Prometheus scrapes it; the
+  controller queries Prometheus's HTTP API (`histogram_quantile(0.99, …)`). **Rejected** an
+  in-process rolling p99 gauge on booking — with 4 gunicorn workers each would have its own window;
+  Prometheus already aggregates across workers and powers the dashboard. **Cost of the choice:** the
+  controller depends on Prometheus being up — mitigated by the hold rule below.
+- **Missing signal → HOLD, never probe up.** `next_rate(rate, None, cfg)` returns the current rate
+  (clamped), never an increase. Ramping admissions with no view of the thing being protected is how
+  you melt it. It does not *decrease* either — a monitoring blip is not a booking outage; starving
+  the queue for a Prometheus hiccup would be its own failure. Fail-safe-decrease was considered and
+  noted as the stricter alternative. **Verified live:** with Prometheus down, `run_backpressure
+  --once` read rate 600, got None, and held at 600 with no write.
+- **Single instance, unlike the leaderless admitter.** N admitters are safe because the rate check
+  and the pop are one atomic Lua step (design.md §7). The backpressure controller has no such
+  protection: two of them would read the same rate and issue conflicting AIMD decisions — a
+  read-modify-write race on `rate_per_min`, and a control loop with two controllers oscillates. So
+  it runs as one process. Running several would need a lock or leader — exactly the coordination the
+  admitter was designed to avoid. A clean contrast worth being able to explain.
+- **Booking metrics use prometheus multiprocess mode**, mirroring the queue service's Phase 13
+  setup, because the booking image runs `gunicorn -w 4` and a per-worker registry would give the
+  controller a p99 that jitters per scrape. `/metrics` branches on `PROMETHEUS_MULTIPROC_DIR`: the
+  aggregating collector under gunicorn, the default registry on the single-process dev server.
+- **rate_min is a trickle, not zero (default 10/min).** Even under sustained overload the queue must
+  still drain; an operator who wants overload to fully pause the drop sets `rate_min = 0` on purpose.
+- **No new dependency (Rule 5):** the Prometheus query uses stdlib `urllib` wrapped in
+  `asyncio.to_thread` — one GET every ~10s does not justify httpx/aiohttp. The fragile parsing
+  (`parse_p99_seconds`: NaN and empty-result handling) is split from the IO and unit-tested.
+- **Verified:** 24 unit tests (control law + parser + orchestration, no IO); both services
+  `manage.py check` clean; booking `/metrics` records real request latency; the no-signal hold path
+  on the live command. **Closed loop MEASURED live (L2, loadtest-report.md):** on the full Docker
+  stack the controller read a real Prometheus booking p99 (56–98 ms) and drove the real admission
+  rate both ways — overload 600→10, healthy 10→150. Caveat: overload was induced by setting the
+  target below the observed p99, not by real booking saturation (a mock-fast booking sits under the
+  200 ms SLO on one laptop) — a valid demonstration of the control *law*, not of a real p99 spike.
+- **Revisit when:** the loop runs live under load (does the sawtooth actually track the booking
+  ceiling? tune `increase_step` / `interval` from what the Grafana graph shows); if multiple
+  backpressure instances are ever wanted, add a leader/lock; a Grafana panel for `rate_per_min` over
+  time would make the control loop visible next to the p99 it chases.
+
+## 2026-08-13 — v2 abuse mitigation: a config-gated per-client join rate limit, and the XFF trap
+
+- **Chose:** two guarantees under one feature. (1) The fairness property the v2 item is named for —
+  reconnecting, refreshing, or manufacturing identities cannot IMPROVE your position — is already
+  enforced by join.lua (`ZADD NX` + monotonic sequence + cookie-bound token), so it is now *proven*
+  by tests (`ReconnectImmunityTests`) rather than asserted. (2) A new **per-(event, client) fixed-
+  window join rate limit** (`lua/rate_limit.lua`) bounds a single-source flood — inflating the
+  queue, exhausting Redis, or fishing for slots with many identities — returning HTTP 429 +
+  `Retry-After` when exceeded.
+- **Why an atomic Lua script (again):** the counter is `INCR` and, on the first hit, `EXPIRE`. Done
+  as two round trips, a crash or race between them leaves a key with a count but NO TTL — it never
+  resets and throttles that client forever. Redis has no "increment and set-expiry-if-new"
+  primitive, so the atomicity comes from the script. Same lesson as admit_batch.lua, in miniature.
+- **Rejected — sliding-window / token-bucket per client:** fixed-window is the simplest correct
+  per-client limiter; its known cost is a 2× burst across a window boundary, accepted for a coarse
+  anti-flood gate. A per-client token bucket (like the admission one) is heavier (a hash per client)
+  for no benefit here.
+- **The X-Forwarded-For trap (core/clientid.py):** behind a proxy, `REMOTE_ADDR` is the proxy — every
+  client identical — so the client IP must come from XFF. But XFF is a client-settable header: trust
+  the wrong end and an abuser spoofs a fresh value per request and never hits the limit. With one
+  trusted proxy (Caddy) the real peer is the **rightmost** XFF hop (the one the proxy appended); the
+  leftmost is the spoofable "claimed" client. `TRUST_PROXY` gates this — it MUST be off when the
+  service is directly exposed, and is on only in the Caddy deployment.
+- **Default OFF (JOIN_RATE_LIMIT=0), an operator kill-switch.** Rate limiting is an operational
+  control whose right limit/window depend on traffic and NAT topology, so it is off until a
+  deployment opts in (the compose enables 30/min). Off, the join path behaves exactly as before and
+  writes no rate-limit state — which is also, honestly, why the existing integration suite (which
+  creates 25 waiters from one test client) is unaffected without editing a single existing test.
+- **Honest limitation:** a per-IP limit bounds a single source, NOT a botnet with many IPs, and NATs
+  make many real users share one IP — so the limit is generous and this is defense in depth, not a
+  silver bullet. Said out loud rather than implied.
+- **A rejoin still counts** toward the request-rate cap (the limit is on requests; a flood of
+  rejoins is still a flood). Position immunity is a separate guarantee (join.lua), so a legitimate
+  reconnect within the limit keeps its exact place — the two properties are independent and both
+  tested.
+- **Verified:** 9 client-id unit tests (the XFF rule, incl. the spoof) + 7 integration tests
+  (enforcement, 429+Retry-After, per-client isolation via distinct XFF, disabled-mode writes no
+  state, reconnect immunity), and the 16 existing join tests still green — the default-off guard
+  proven to be a true no-op.
+- **Revisit when:** abuse is seen from many IPs (needs a different signal — proof-of-work, device
+  fingerprint, or account binding); or if a per-IP SSE *connection* cap is wanted (one IP holding
+  thousands of streams is a separate DoS this does not address).
+
+## 2026-08-13 — v2 horizontal scaling: load-balance across replicas with Caddy dynamic upstreams
+
+- **Chose:** demonstrate the stateless-scaling claim (design.md §9) directly — run 3 queue replicas
+  (`docker compose up --scale queue=3`) and load-balance across them with Caddy's `dynamic a` upstream
+  (`name queue; port 8001; refresh 5s` + `lb_policy round_robin`), which re-resolves the Docker
+  service DNS and round-robins over every replica it returns. Verified live (L3): 18 requests
+  distributed 6/6/6, and one admission from a single admitter delivered an `admitted` frame to SSE
+  streams on all three replicas (2/2/2) — cross-replica pub/sub fan-out, the thing that makes it scale.
+- **The finding that motivated it:** the original `reverse_proxy queue:8001` resolves the name ONCE
+  and pins every request to a single replica — 18/18 landed on `queue-1`. That is effectively sticky
+  routing, and it is exactly the failure the "sticky vs stateless" question in design.md §9 is about.
+  The design is stateless; the *default proxy config* was quietly not using it.
+- **Rejected — adding an Nginx service** (what CLAUDE.md §6 literally names): the stack already fronts
+  everything with Caddy, and a second proxy layer purely to load-balance one upstream is redundant.
+  Caddy's dynamic upstreams give the same round-robin-across-replicas behaviour in the proxy we
+  already run. The design point CLAUDE.md cares about — *stateless, no sticky sessions, write about
+  it* — is fully served; the specific choice of Nginx is not load-bearing. Noted as a conscious
+  deviation from the §6 wording.
+- **Rejected — sticky/consistent-hashing at the LB:** unnecessary by construction (a waiter's place
+  is in Redis, keyed by token; every replica subscribes to the same channels), and it would cost
+  affinity that survives a restart plus a rebalancing story. The whole point of the O(1)-position +
+  one-subscriber-per-process design is that it buys statelessness, so the LB can be dumb.
+- **SSE connections are not migrated between replicas** and do not need to be: they are long-lived
+  and land on whichever replica accepted them, but nothing about a connection is unique to a replica
+  (position is Redis + arithmetic; the fan-out subscriber runs in every replica). Round-robin at
+  *connect* is the only balancing needed.
+- **What is NOT proven:** a throughput number — 3 replicas share one laptop's CPU and one Redis, so
+  this shows the stateless *property*, not scale. And Prometheus still scrapes a single replica
+  (static `queue:8001`), so per-replica aggregate metrics would need DNS service discovery.
+- **Revisit when:** running on real separate boxes (then a throughput number is meaningful, and
+  Prometheus needs service discovery); at much larger N, shard pub/sub channels by event so each
+  replica does not fan out every event's traffic (design.md §9).

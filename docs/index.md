@@ -72,5 +72,27 @@ controlled rate, and book — end to end, with a forged pass rejected. The three
 about (oversell, queue-jumping on join, over-admission) are each demonstrated failing against a
 deliberately broken implementation and then holding.
 
-Still ahead: **Phase 14, the k6 load tests — so [`loadtest-report.md`](loadtest-report.md) is empty
-and no performance number may leave it.** See [`build-plan.md`](build-plan.md) §6.
+**Phase 14 has its first run** ([`loadtest-report.md`](loadtest-report.md) L1, 2026-08-13): a local
+single-process *floor* — 3,000 SSE connections held on one uvicorn worker, with steady-state Redis
+command volume flat (3) across 500 → 3,000 connections, and join at ~526 req/s. Two numbers may now
+leave the report (the 3,000 floor, and the flatness); everything larger — 20K, multi-node, p99 <
+200 ms, k6, Sentinel — stays ⏳. See [`build-plan.md`](build-plan.md) §6.
+
+**v2 pick #1 — dynamic backpressure — is built and the closed loop is MEASURED** (2026-08-13): an
+AIMD controller (`core/backpressure.py`, 24 unit tests) auto-tunes the admission rate to the booking
+service's p99, read from a new booking Prometheus histogram. L2 in
+[`loadtest-report.md`](loadtest-report.md) demonstrated the loop *live* on the full Docker stack —
+reading a real p99, the controller drove the rate down on overload (600→10) and up on health
+(10→150) — with the caveat that overload was induced via the target, not real booking saturation.
+See [`design.md`](design.md) §7 and [`decisions.md`](decisions.md) (2026-08-13).
+
+**v2 pick #2 — abuse mitigation — is built and fully tested** (2026-08-13): reconnecting or
+manufacturing identities cannot improve your position (join.lua, now *proven* by tests), plus a
+config-gated per-client **join rate limit** (`lua/rate_limit.lua`, 429 + `Retry-After`) that bounds a
+single-source flood. 16 new tests green (incl. the X-Forwarded-For spoof rule), existing join tests
+unaffected. See [`design.md`](design.md) §5 and [`decisions.md`](decisions.md) (2026-08-13).
+
+**v2 pick #3 — horizontal scaling — is MEASURED** (2026-08-13, L3): 3 queue replicas behind a
+round-robin load balancer (Caddy `dynamic a`) — requests distributed 6/6/6, and one admission reached
+SSE streams on all three replicas (2/2/2), proving the stateless / no-sticky-sessions design. All
+three v2 picks are now done. See [`design.md`](design.md) §9 and [`decisions.md`](decisions.md).

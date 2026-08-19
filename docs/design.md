@@ -301,6 +301,22 @@ and runs a script to completion**: no other command from any client interleaves.
 
 FR-2, FR-3 and FR-4 are all this script.
 
+### Abuse mitigation (v2) — you cannot manufacture a better place
+
+The same script quietly delivers a fairness-under-abuse property: **reconnecting, refreshing, or
+opening many tabs can never IMPROVE your position.** `ZADD NX` means a token that is already queued
+keeps its original score, so a rejoin returns the exact place it held; and every genuinely new
+identity draws the *next* sequence, which is strictly worse. There is no sequence of client actions
+that lowers your own number — proven, not asserted, in `tests/test_ratelimit.py::ReconnectImmunity`.
+
+What that does not stop is *volume*: one client hammering `join` to inflate the queue, exhaust
+Redis, or fish for slots with a flood of identities. A v2 **per-(event, client) fixed-window rate
+limit** (`lua/rate_limit.lua`) bounds it, returning 429 + `Retry-After`. It is config-gated
+(off by default, enabled in the deployment) and keys on the client IP — the *rightmost*
+X-Forwarded-For hop behind a trusted proxy, because XFF is client-settable and trusting the wrong
+end is a free bypass. Its honest limit — a botnet with many IPs, and NAT sharing — and the atomicity
+argument for the script are in `decisions.md` (2026-08-13).
+
 ---
 
 ## 6. Position without a Redis call
@@ -473,6 +489,30 @@ because **the rate check and the pop must be atomic *together*** — that is the
 justification, and "we used Lua because Redis operations aren't atomic" is the wrong answer to
 give an interviewer.
 
+### Dynamic backpressure (v2) — who sets the rate
+
+Everything above enforces a rate; it does not decide one. `rate_per_min` lives in the event's
+config hash, and `admit_batch.lua` re-reads it every tick (FR-13), so it can change mid-drop with
+no restart. Phase 8 built that knob for a *human* operator. v2 automates the operator: a control
+loop reads the booking service's p99 and moves the rate to hold it near an SLO.
+
+The control law is **AIMD** — additive increase while the booking service is healthy, multiplicative
+decrease the moment its p99 crosses the target — the same law TCP uses for congestion control, and
+for the same reason: over-admitting is an outage of the thing the queue protects, under-admitting is
+a slightly longer wait, so the response to the two must be asymmetric (shed load hard, reclaim it
+gently). The p99 is real: the booking service records request latency in a Prometheus histogram, and
+the controller reads `histogram_quantile(0.99, …)` from Prometheus. A missing signal means *hold*,
+never probe up — raising load on a service you cannot see is how you melt it.
+
+**One structural point worth the interview:** the admitter is deliberately leaderless (§7), but this
+controller must run as a *single* instance. Its logic is a read-modify-write on `rate_per_min` with
+a decision in between — not one atomic step — so two controllers would race and, being a control
+loop, oscillate. Same system, opposite answer: atomicity where you can get it (the admitter),
+exclusivity where you can't (the controller). Full rationale and the rejected alternatives
+(proportional, PID; an in-process p99 gauge; fail-safe-decrease) are in `decisions.md`
+(2026-08-13). Built and unit-tested (`core/backpressure.py`, 24 tests); the closed loop under live
+load is the pending validation.
+
 ---
 
 ## 8. SSE fan-out
@@ -540,7 +580,13 @@ being able to say why rather than just picking the right one.
 
 ## 9. Horizontal scaling
 
-**Not built.** v2 in CLAUDE.md §6.
+**Demonstrated (2026-08-13, L2… see [`loadtest-report.md`](loadtest-report.md) L3).** Ran 3 queue
+replicas behind Caddy load-balancing (`dynamic a` + round-robin): requests distributed 6/6/6, and a
+single admission broadcast reached SSE streams on all three replicas (2/2/2) — the stateless property
+below, confirmed rather than argued. A one-line finding fell out of it: the naive `reverse_proxy
+queue:8001` resolves once and pins to one replica (effectively sticky), which is precisely the
+mistake the "sticky vs stateless" question is about. What is *not* shown is a throughput number —
+3 replicas share one laptop's CPU and one Redis.
 
 The interesting question is sticky versus stateless load balancing, and this design answers it by
 construction:
@@ -631,15 +677,17 @@ anyway; what they can perceive is a queue that stalls because another continent 
 
 ## 13. What we intend to prove
 
-Nothing in this section is measured yet. It exists so the load test has a target to falsify, and
-so [`resume-claims.md`](resume-claims.md) has something concrete to check against.
+First numbers landed 2026-08-13 (L1 in [`loadtest-report.md`](loadtest-report.md)) — a local
+single-process floor. Most rows are still ⏳; the two L1 touched are marked 📏 with their caveat.
+This section exists so the load test has a target to falsify.
 
 | Claim to test | Target | Method | Status |
 |---|---|---|---|
-| Concurrent SSE connections held on one box | 10,000 | k6, ramped, `ulimit -n` and `somaxconn` raised first | ⏳ not run |
+| Concurrent SSE connections held on one box | 10,000 | k6, ramped, `ulimit -n` and `somaxconn` raised first | 📏 **3,000 held on 1 uvicorn worker, 0 failed** (L1 — a local floor, not the 10K target; k6 + Gunicorn still ⏳) |
 | Concurrent SSE connections, 3 processes | 20,000 | as above, behind Nginx | ⏳ not run |
 | Position-update p99, end to end | < 200 ms | timestamp in the admission message vs client receipt | ⏳ not run |
-| Redis ops/sec is flat in connection count | flat | Redis `INFO commandstats` at 1K vs 10K connections | ⏳ not run |
+| Redis ops/sec is flat in connection count | flat | Redis `INFO commandstats` at 1K vs 10K connections | 📏 **flat: steady hold = 3 cmds at 500 / 1,500 / 3,000 connections** (L1; 1K→10K still ⏳) |
+| Backpressure closed loop drives rate from booking p99 | both directions | live Docker stack; real Prometheus p99; observe `rate_per_min` | 📏 **yes, live (L2)**: overload 600→10, healthy 10→150; caveat — overload induced via the target, not real booking saturation |
 | Memory per connection | to be discovered | RSS delta ÷ connections | ⏳ not run |
 | No over-admission under concurrent admitters | exact | count issued passes vs configured rate, 3 processes | ⏳ not run |
 | No oversell under true concurrency | exact | parallel booking load; `TransactionTestCase`, not `APITestCase` | ⏳ **D1 tests are sequential — this is explicitly not yet proven** |
@@ -657,3 +705,4 @@ produced it. **A number that is not in that file does not go on a resume** (CLAU
 |---|---|---|
 | 2026-08-02 | Created. FR-1..FR-30 with build status; Redis model; the join race and the admission race written out as interleavings; O(1) position arithmetic with its three preconditions; one-subscriber-per-process fan-out; failure modes with Redis named as the v1 SPOF. | Design doc promised by CLAUDE.md §5 and never written; queue service about to start |
 | 2026-08-02 | Queue service specified as async Django (ASGI), not FastAPI | See `decisions.md` 2026-08-02 |
+| 2026-08-13 | §13: first two rows measured (SSE connections held → 3,000 single-process floor; Redis ops flat across 500→3,000) | Phase 14 L1 run, see `loadtest-report.md` and `decisions.md` 2026-08-13 |
