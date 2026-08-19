@@ -5,8 +5,22 @@
 	# Queue API, including the SSE stream. flush_interval -1 disables response buffering so SSE
 	# frames reach the browser immediately — the Caddy equivalent of Nginx's `proxy_buffering off`
 	# (CLAUDE.md §8). Harmless for the small join/position responses.
+	#
+	# `dynamic a` re-resolves the `queue` service name against Docker's DNS every few seconds and
+	# load-balances (round-robin) across EVERY replica it returns — so `docker compose up --scale
+	# queue=N` is picked up live with no Caddyfile change. A plain `reverse_proxy queue:8001` pins to
+	# one replica (resolved once), which is effectively sticky; this is the stateless demonstration
+	# the design (design.md §9) argues for. SSE connections still live on whichever replica accepted
+	# them — long-lived, not migrated — which is fine because no per-connection state is unique to a
+	# replica (position is Redis + arithmetic; the fan-out subscriber runs in every replica).
 	handle /api/queue/* {
-		reverse_proxy queue:8001 {
+		reverse_proxy {
+			dynamic a {
+				name queue
+				port 8001
+				refresh 5s
+			}
+			lb_policy round_robin
 			flush_interval -1
 		}
 	}
